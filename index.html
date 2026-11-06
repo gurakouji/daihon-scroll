@@ -139,7 +139,7 @@ const $ = id => document.getElementById(id);
 const view = $('view'), pagesEl = $('pages');
 
 // ---------- 設定（ブラウザに保存） ----------
-const settings = Object.assign({ readLine: 30, strict: 35, zoom: 1 }, load('settings') || {});
+const settings = Object.assign({ readLine: 30, strict: 30, zoom: 1 }, load('settings') || {});
 function load(k){ try { return JSON.parse(localStorage.getItem('daihon_' + k)); } catch(e){ return null; } }
 function save(k, v){ try { localStorage.setItem('daihon_' + k, JSON.stringify(v)); } catch(e){} }
 
@@ -306,7 +306,7 @@ async function renderPage(p){
 // 聞こえた文字列の末尾を2文字ずつに区切り、台本のどこに一番まとまって現れるかを投票で探す
 function findPosition(heard){
   const q = normalize(heard).slice(-24);
-  if (q.length < 4 || !S) return null;
+  if (q.length < 3 || !S) return null;
   const m = q.length - 1;
   const strict = settings.strict / 100;
 
@@ -342,7 +342,10 @@ function findPosition(heard){
     return null;
   };
 
-  // まずは現在位置の少し前〜先の範囲、だめなら台本全体を厳しめに
+  // ① すぐ先（少し前〜250字先）は、少ない一致でも反応して素早く追う
+  const near = tryRange(cursor - 30, cursor + 250, Math.max(3, m * strict * 0.5));
+  if (near) return near.end;
+  // ② 少し広い範囲、③ だめなら台本全体を厳しめに
   const local = tryRange(cursor - 120, cursor + 1500, Math.max(3, m * strict));
   if (local) return local.end;
   const global = tryRange(0, S.length, Math.max(6, m * Math.min(0.9, strict + 0.25)));
@@ -367,10 +370,60 @@ function placeHighlight(smooth){
     display: 'block', left: (it.x * s - 4) + 'px', top: (it.y * s - 3) + 'px',
     width: (it.w * s + 8) + 'px', height: (it.h * s + 6) + 'px'
   });
-  if (Date.now() < manualUntil) return;
-  const target = p.div.offsetTop + it.y * s - view.clientHeight * settings.readLine / 100;
-  scrollToY(target, smooth);
+  if (!smooth && Date.now() >= manualUntil) scrollToY(scrollTargetFor(cursor), false);
 }
+
+// 台本上の位置 pos を「読む行」に置くためのスクロール量
+// 行の途中なら、その行と次の行の間をなめらかにつなぐ（プロンプターのように少しずつ流れる）
+function scrollTargetFor(pos){
+  const N = charItem.length;
+  const i = Math.max(0, Math.min(Math.floor(pos) - 1, N - 1));
+  const yOf = k => { const [pi, ii] = charItem[k]; return [pi, pages[pi].items[ii].y]; };
+  const [pi, y] = yOf(i);
+  let start = i, next = i;
+  while (start > 0 && i - start < 200) { const [pp, yy] = yOf(start - 1); if (pp !== pi || Math.abs(yy - y) > 2) break; start--; }
+  while (next < N - 1 && next - i < 200) { const [pp, yy] = yOf(next + 1); if (pp !== pi || Math.abs(yy - y) > 2) break; next++; }
+  let yy = y;
+  if (next + 1 < N) {
+    const [np, ny] = yOf(next + 1);
+    if (np === pi && ny > y) yy = y + (ny - y) * Math.min(1, (pos - 1 - start) / (next + 1 - start));
+  }
+  return pages[pi].div.offsetTop + yy * pageScale - view.clientHeight * settings.readLine / 100;
+}
+
+// ---------- 先読みスクロール ----------
+// 認識結果は少し遅れて届くので、直近の読む速さから「今このあたりを読んでいるはず」を予想して、
+// 一致を待たずになめらかに先へ進める。外れたら次の一致ですぐ補正される。
+let hits = [];            // {t:時刻, pos:位置}
+function recordHit(pos){
+  const now = performance.now();
+  hits.push({ t: now, pos });
+  hits = hits.filter(h => now - h.t < 10000);
+}
+function readingSpeed(){ // 文字/ミリ秒
+  if (hits.length < 2) return 0;
+  const a = hits[0], b = hits[hits.length - 1];
+  if (b.t - a.t < 800 || b.pos <= a.pos) return 0;
+  return Math.min((b.pos - a.pos) / (b.t - a.t), 0.02); // 上限 20文字/秒
+}
+let lastFrame = performance.now();
+function followLoop(now){
+  requestAnimationFrame(followLoop);
+  const dt = Math.min(now - lastFrame, 500); lastFrame = now;
+  if (!charItem.length || anim || Date.now() < manualUntil || drawing) return;
+  let pos = cursor;
+  const last = hits[hits.length - 1];
+  if (listening && last && last.pos === cursor) {
+    const since = Math.min(performance.now() - last.t, 2500); // 2.5秒以上は先読みしない
+    pos = cursor + Math.min(readingSpeed() * since, 30);       // 最大30文字先まで
+  }
+  const target = Math.max(0, scrollTargetFor(pos));
+  const d = target - view.scrollTop;
+  if (Math.abs(d) < 0.5) return;
+  // 画面のコマ数に関係なく、約0.15秒で目標の6割まで近づく速さ。遠いときは一気に
+  view.scrollTop += Math.abs(d) > view.clientHeight * 2 ? d : d * (1 - Math.exp(-dt / 160));
+}
+requestAnimationFrame(followLoop);
 
 // 同じ高さに並んでいる文字のかたまりをまとめて「1行」として光らせる
 function lineBox(items, ii){
@@ -498,7 +551,7 @@ function startRec(){
   rec.onend = () => {
     $('dot').className = '';
     // iPad は一定時間で勝手に止まるので、聞き取り中なら自動で再開する
-    if (listening) restartTimer = setTimeout(() => { try { startRec(); } catch(e) {} }, 250);
+    if (listening) restartTimer = setTimeout(() => { try { startRec(); } catch(e) {} }, 0);
   };
   try { rec.start(); } catch(e) { console.warn(e); }
 }
@@ -522,6 +575,7 @@ function onHeard(txt){
   // 後戻りは少しだけ許す（言い直しなど）。大きく戻るのは全体検索で強く一致したときだけ
   if (pos !== cursor) {
     setCursor(pos, false);
+    recordHit(pos);
     $('dot').className = 'hit';
     clearTimeout(onHeard.t);
     onHeard.t = setTimeout(() => $('dot').className = listening ? 'listen' : '', 300);
